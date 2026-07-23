@@ -4,14 +4,22 @@
 #include <net-snmp/net-snmp-config.h>
 #include <net-snmp/net-snmp-includes.h>
 #include <sys/types.h>
+#ifdef _WIN32
+/* On Windows the socket API (inet_addr, etc.) lives in winsock, not the
+   POSIX arpa/inet.h and netdb.h headers. net-snmp-includes.h already pulls
+   in winsock2.h; ws2tcpip.h provides the address helpers we use. */
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
+#include <netdb.h>
+#endif
 #include <errno.h>
 #include <stdio.h>
 #include <ctype.h>
 #ifdef I_SYS_TIME
 #include <sys/time.h>
 #endif
-#include <netdb.h>
 #include <stdlib.h>
 
 #ifdef HAVE_REGEX_H
@@ -1037,16 +1045,36 @@ py_netsnmp_attr_set_bytes(PyObject *obj, char *attr_name,
 }
 
 static int
-py_netsnmp_attr_bytes(PyObject *obj, char * attr_name, char **val,
-    Py_ssize_t *len)
+py_netsnmp_attr_value(PyObject *obj, char *attr_name, char **val,
+    Py_ssize_t *len, PyObject **value_obj)
 {
   *val = NULL;
+  *value_obj = NULL;
   if (obj && attr_name && PyObject_HasAttrString(obj, attr_name)) {
     PyObject *attr = PyObject_GetAttrString(obj, attr_name);
     if (attr) {
-      int retval;
-      retval = PyBytes_AsStringAndSize(attr, val, len);
-      Py_DECREF(attr);
+      int retval = -1;
+
+      if (PyBytes_Check(attr)) {
+        retval = PyBytes_AsStringAndSize(attr, val, len);
+      } else {
+        PyObject *str_attr = PyObject_Str(attr);
+        Py_DECREF(attr);
+        attr = str_attr;
+        if (attr) {
+          const char *str_val = PyUnicode_AsUTF8AndSize(attr, len);
+          if (str_val) {
+            *val = (char *)str_val;
+            retval = 0;
+          }
+        }
+      }
+
+      if (retval == 0) {
+        *value_obj = attr;
+      } else {
+        Py_XDECREF(attr);
+      }
       return retval;
     }
   }
@@ -1338,6 +1366,12 @@ error:
 end:
   free (session.securityEngineID);
   free (session.contextEngineID);
+  /* snmp_sess_open() duplicates the security protocol OIDs into the session
+     it returns, so the copies made above are ours to release. Freeing them
+     here also covers the early "goto end" paths, where the privacy protocol
+     is rejected after the authentication protocol was already duplicated. */
+  free (session.securityAuthProto);
+  free (session.securityPrivProto);
 
   if (PyErr_Occurred()) {
     return NULL;
@@ -1527,8 +1561,12 @@ netsnmp_get(PyObject *self, PyObject *args)
 
     if (varlist) {
       PyObject *varlist_iter = PyObject_GetIter(varlist);
+      if (!varlist_iter) {
+        snmp_free_pdu(pdu);
+        goto done;
+      }
 
-      while (varlist_iter && (varbind = PyIter_Next(varlist_iter))) {
+      while ((varbind = PyIter_Next(varlist_iter))) {
         if (py_netsnmp_attr_string(varbind, "tag", &tag, NULL) < 0 ||
             py_netsnmp_attr_string(varbind, "iid", &iid, NULL) < 0)
         {
@@ -1605,6 +1643,9 @@ netsnmp_get(PyObject *self, PyObject *args)
         vars && (varlist_ind < varlist_len);
         vars = vars->next_variable, varlist_ind++) {
 
+      if (err_ind >= 1 && varlist_ind >= err_ind - 1)
+        continue;
+
       varbind = PySequence_GetItem(varlist, varlist_ind);
 
       if (PyObject_HasAttrString(varbind, "tag")) {
@@ -1674,6 +1715,10 @@ netsnmp_get(PyObject *self, PyObject *args)
 
 done:
   SAFE_FREE(oid_arr);
+  if (PyErr_Occurred()) {
+    Py_XDECREF(val_tuple);
+    return NULL;
+  }
   return (val_tuple ? val_tuple : Py_BuildValue(""));
 }
 
@@ -1745,8 +1790,12 @@ netsnmp_getnext(PyObject *self, PyObject *args)
 
     if (varlist) {
       PyObject *varlist_iter = PyObject_GetIter(varlist);
+      if (!varlist_iter) {
+        snmp_free_pdu(pdu);
+        goto done;
+      }
 
-      while (varlist_iter && (varbind = PyIter_Next(varlist_iter))) {
+      while ((varbind = PyIter_Next(varlist_iter))) {
         if (py_netsnmp_attr_string(varbind, "tag", &tag, NULL) < 0 ||
             py_netsnmp_attr_string(varbind, "iid", &iid, NULL) < 0)
         {
@@ -1894,6 +1943,10 @@ netsnmp_getnext(PyObject *self, PyObject *args)
 
 done:
   SAFE_FREE(oid_arr);
+  if (PyErr_Occurred()) {
+    Py_XDECREF(val_tuple);
+    return NULL;
+  }
   return (val_tuple ? val_tuple : Py_BuildValue(""));
 }
 
@@ -1911,7 +1964,7 @@ netsnmp_walk(PyObject *self, PyObject *args)
   netsnmp_session *ss;
   netsnmp_pdu *pdu, *response;
   netsnmp_pdu *newpdu;
-  netsnmp_variable_list *vars, *oldvars;
+  netsnmp_variable_list *vars;
   struct tree *tp;
   int len;
   oid **oid_arr = NULL;
@@ -1976,10 +2029,19 @@ netsnmp_walk(PyObject *self, PyObject *args)
 
     pdu = snmp_pdu_create(SNMP_MSG_GETNEXT);
 
+    if (!pdu) {
+      PyErr_NoMemory();
+      goto done;
+    }
+
     /* we need an initial count for memory allocation */
     varlist_iter = PyObject_GetIter(varlist);
+    if (!varlist_iter) {
+      snmp_free_pdu(pdu);
+      goto done;
+    }
     varlist_len = 0;
-    while (varlist_iter && (varbind = PyIter_Next(varlist_iter))) {
+    while ((varbind = PyIter_Next(varlist_iter))) {
       varlist_len++;
     }
     Py_DECREF(varlist_iter);
@@ -1990,10 +2052,23 @@ netsnmp_walk(PyObject *self, PyObject *args)
     oid_arr                  = calloc(varlist_len, sizeof(oid *));
     oid_arr_broken_check     = calloc(varlist_len, sizeof(oid *));
 
+    if (varlist_len && (!oid_arr_len || !oid_arr_broken_check_len ||
+        !oid_arr || !oid_arr_broken_check)) {
+      PyErr_NoMemory();
+      snmp_free_pdu(pdu);
+      goto done;
+    }
+
     for(varlist_ind = 0; varlist_ind < varlist_len; varlist_ind++) {
 
       oid_arr[varlist_ind] = calloc(MAX_OID_LEN, sizeof(oid));
       oid_arr_broken_check[varlist_ind] = calloc(MAX_OID_LEN, sizeof(oid));
+
+      if (!oid_arr[varlist_ind] || !oid_arr_broken_check[varlist_ind]) {
+        PyErr_NoMemory();
+        snmp_free_pdu(pdu);
+        goto done;
+      }
 
       oid_arr_len[varlist_ind]              = MAX_OID_LEN;
       oid_arr_broken_check_len[varlist_ind] = MAX_OID_LEN;
@@ -2101,8 +2176,6 @@ netsnmp_walk(PyObject *self, PyObject *args)
         vars != NULL;
         vars = vars->next_variable, varlist_ind++) {
 
-      oid_arr_broken_check[varlist_ind] = calloc(MAX_OID_LEN, sizeof(oid));
-
       oid_arr_broken_check_len[varlist_ind] = vars->name_length;
       memcpy(oid_arr_broken_check[varlist_ind],
           vars->name, vars->name_length * sizeof(oid));
@@ -2121,12 +2194,17 @@ netsnmp_walk(PyObject *self, PyObject *args)
       } else {
         newpdu = snmp_pdu_create(SNMP_MSG_GETNEXT);
 
+        if (!newpdu) {
+          PyErr_NoMemory();
+          snmp_free_pdu(response);
+          response = NULL;
+          break;
+        }
+
         for(vars = (response ? response->variables : NULL),
-            varlist_ind = 0,
-            oldvars = (pdu ? pdu->variables : NULL);
+            varlist_ind = 0;
             vars && (varlist_ind < varlist_len);
-            vars = vars->next_variable, varlist_ind++,
-            oldvars = (oldvars ? oldvars->next_variable : NULL)) {
+            vars = vars->next_variable, varlist_ind++) {
 
           if ((vars->name_length < oid_arr_len[varlist_ind]) ||
               (memcmp(oid_arr[varlist_ind], vars->name,
@@ -2220,7 +2298,10 @@ application.
           snmp_add_null_var(newpdu, vars->name,
               vars->name_length);
         }
-        pdu = newpdu;
+        if (notdone)
+          pdu = newpdu;
+        else
+          snmp_free_pdu(newpdu);
       }
       if (response)
         snmp_free_pdu(response);
@@ -2236,7 +2317,7 @@ application.
       /* propagate error */
       if (verbose)
         printf("error: walk response processing: unknown python error");
-      Py_DECREF(val_tuple);
+      Py_CLEAR(val_tuple);
     } 
   }
 
@@ -2244,12 +2325,16 @@ done:
   Py_XDECREF(varbinds);
   SAFE_FREE(oid_arr_len);
   SAFE_FREE(oid_arr_broken_check_len);
-  for(varlist_ind = 0; varlist_ind < varlist_len; varlist_ind ++) {
-    SAFE_FREE(oid_arr[varlist_ind]);
-    SAFE_FREE(oid_arr_broken_check[varlist_ind]);
-  }
+  if (oid_arr)
+    for(varlist_ind = 0; varlist_ind < varlist_len; varlist_ind ++)
+      SAFE_FREE(oid_arr[varlist_ind]);
+  if (oid_arr_broken_check)
+    for(varlist_ind = 0; varlist_ind < varlist_len; varlist_ind ++)
+      SAFE_FREE(oid_arr_broken_check[varlist_ind]);
   SAFE_FREE(oid_arr);
   SAFE_FREE(oid_arr_broken_check);
+  if (PyErr_Occurred())
+    return NULL;
   return (val_tuple ? val_tuple : Py_BuildValue(""));
 }
 
@@ -2487,14 +2572,16 @@ netsnmp_getbulk(PyObject *self, PyObject *args)
       /* propagate error */
       if (verbose)
         printf("error: getbulk response processing: unknown python error");
-      if (val_tuple)
-        Py_DECREF(val_tuple);
-      val_tuple = NULL;
+      Py_CLEAR(val_tuple);
     }
   }
 
 done:
   SAFE_FREE(oid_arr);
+  if (PyErr_Occurred()) {
+    Py_XDECREF(val_tuple);
+    return NULL;
+  }
   return (val_tuple ? val_tuple : Py_BuildValue(""));
 }
 
@@ -2503,7 +2590,7 @@ netsnmp_set(PyObject *self, PyObject *args)
 {
   PyObject *session;
   PyObject *varlist;
-  PyObject *varbind;
+  PyObject *varbind = NULL;
   PyObject *ret = NULL;
   netsnmp_session *ss;
   netsnmp_pdu *pdu, *response;
@@ -2527,6 +2614,7 @@ netsnmp_set(PyObject *self, PyObject *args)
   char err_str[STR_BUF_SIZE];
   char *tmpstr;
   Py_ssize_t tmplen;
+  PyObject *value_obj = NULL;
 
   oid_arr = calloc(MAX_OID_LEN, sizeof(oid));
 
@@ -2551,8 +2639,12 @@ netsnmp_set(PyObject *self, PyObject *args)
 
     if (varlist) {
       PyObject *varlist_iter = PyObject_GetIter(varlist);
+      if (!varlist_iter) {
+        snmp_free_pdu(pdu);
+        goto done;
+      }
 
-      while (varlist_iter && (varbind = PyIter_Next(varlist_iter))) {
+      while ((varbind = PyIter_Next(varlist_iter))) {
         if (py_netsnmp_attr_string(varbind, "tag", &tag, NULL) < 0 ||
             py_netsnmp_attr_string(varbind, "iid", &iid, NULL) < 0)
         {
@@ -2583,7 +2675,8 @@ netsnmp_set(PyObject *self, PyObject *args)
           }
         }
 
-        if (py_netsnmp_attr_bytes(varbind, "val", &val, &tmplen) < 0) {
+        if (py_netsnmp_attr_value(varbind, "val", &val, &tmplen,
+              &value_obj) < 0) {
           snmp_free_pdu(pdu);
           goto done;
         }
@@ -2604,6 +2697,7 @@ netsnmp_set(PyObject *self, PyObject *args)
         len = (int)tmplen;
         status = __add_var_val_str(pdu, oid_arr, oid_arr_len,
             (char *) tmp_val_str, len, type);
+        Py_CLEAR(value_obj);
 
         if (verbose && status == FAILURE)
           printf("error: set: adding variable/value to PDU");
@@ -2635,8 +2729,11 @@ netsnmp_set(PyObject *self, PyObject *args)
       ret = Py_BuildValue("i",0); /* fail, return False */
   } 
 done:
+  Py_XDECREF(value_obj);
   Py_XDECREF(varbind); 
   SAFE_FREE(oid_arr);
+  if (PyErr_Occurred())
+    return NULL;
   return (ret ? ret : Py_BuildValue(""));
 }
 
